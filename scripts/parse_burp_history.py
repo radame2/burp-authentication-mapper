@@ -193,8 +193,10 @@ def process_files(files, cutoff):
 
     for req, resp, notes in all_pairs:
         dt = parse_date_header(resp)
-        if dt is None or dt < cutoff:
+        if dt is not None and dt < cutoff:
             continue
+        if dt is None:
+            dt = datetime.now(timezone.utc)
 
         # Extract method and path
         method_match = re.match(r"(\w+)\s+(\S+)\s+HTTP", req)
@@ -208,8 +210,8 @@ def process_files(files, cutoff):
         status = status_match.group(1) if status_match else "?"
 
         # Host
-        host_match = re.search(r"Host:\s*(\S+)", req)
-        host = host_match.group(1).replace("\\r", "") if host_match else "unknown"
+        host_match = re.search(r"Host:\s*(.+?)\\r\\n", req)
+        host = host_match.group(1).strip() if host_match else "unknown"
 
         # Dedup
         key = f"{method}|{path}|{dt.isoformat()}"
@@ -220,8 +222,8 @@ def process_files(files, cutoff):
         # Extract details
         set_cookies = extract_set_cookies(resp)
         cookies_sent = extract_cookie_header(req)
-        location_match = re.search(r"Location:\s*(\S+)", resp)
-        location = location_match.group(1).replace("\\r", "") if location_match else ""
+        location_match = re.search(r"Location:\s*(.+?)\\r\\n", resp)
+        location = location_match.group(1).strip() if location_match else ""
         hidden_fields = extract_hidden_fields(resp)
 
         body = ""
