@@ -144,14 +144,12 @@ burp-authentication-mapper/
 │   ├── auth_patterns.md             # Regex patterns and flow classification rules
 │   ├── security_checklist.md        # Security evaluation criteria
 │   └── example_output.md            # DVWA example for formatting reference
-├── platforms/
-│   ├── claude/
-│   │   └── burp-authentication-mapper.zip   # Claude Code skill package
-│   └── gemini/
-│       ├── GEMINI.md                        # Standalone context file (manual fallback)
-│       └── burp-auth-map.toml               # Gemini CLI slash command definition
-└── tools/
-    └── burp-authentication-mapper-sync/     # Companion skill to sync edits back to this repo
+└── platforms/
+    ├── claude/
+    │   └── burp-authentication-mapper.zip   # Claude Code skill package
+    └── gemini/
+        ├── GEMINI.md                        # Standalone context file (manual fallback)
+        └── burp-auth-map.toml               # Gemini CLI slash command definition
 ```
 
 `prompt.md` is the authoritative source. Platform files in `platforms/` are derived from it.
