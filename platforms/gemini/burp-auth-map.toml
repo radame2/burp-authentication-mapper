@@ -1,0 +1,36 @@
+# Gemini CLI slash command for burp-authentication-mapper
+#
+# Installation:
+#   mkdir -p ~/.gemini/commands
+#   cp burp-auth-map.toml ~/.gemini/commands/
+#
+# Then in Gemini CLI:
+#   /commands reload
+#
+# Usage:
+#   /burp-auth-map
+#   /burp-auth-map 30m
+#   /burp-auth-map 1h
+#
+# Note: Works best when paired with the native skill (Option B) or
+# gemini-cli-skillz (Option A) so Gemini has access to the full
+# workflow instructions, reference files, and parser script.
+
+description = "Map authentication flows from Burp Suite HTTP History"
+prompt = """
+Follow the burp-authentication-mapper workflow.
+
+If the user provided a time argument (e.g. 5m, 30m, 1h, 2h), use it to scope
+the analysis window. If no argument was provided, scan the full HTTP History.
+
+Fetch auth-related Burp proxy history using get_proxy_http_history_regex, classify
+each request into an authentication flow step, and produce:
+
+1. ASCII sequence diagram (Browser / Burp Proxy / Server)
+2. Session identifiers table (lifecycle state, request count, context)
+3. CSRF / anti-forgery tokens table (where issued, where submitted)
+4. Security observations table (Finding, Detail, Risk/Rating)
+5. Authentication type classification (form-based, token-based, MFA, SSO, Basic/Digest)
+
+Mask all password values with ****.
+"""
