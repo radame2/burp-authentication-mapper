@@ -156,6 +156,10 @@ burp-authentication-mapper/
 
 `prompt.md` is the authoritative source. Platform files in `platforms/` are derived from it.
 
+## Legal & Responsible Use
+
+This tool is intended for **authorized security testing, CTF competitions, and educational purposes only**. Only use it against systems you own or have explicit written permission to test.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
