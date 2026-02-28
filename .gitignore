@@ -6,6 +6,9 @@ __pycache__/
 # Temporary sync build directory
 burp-authentication-mapper-sync/
 
+# Sync skill — local only, not tracked in repo
+tools/burp-authentication-mapper-sync/
+
 # Logs
 *.log
 
