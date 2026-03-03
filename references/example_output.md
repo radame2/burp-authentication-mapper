@@ -6,7 +6,7 @@ Use this as a format reference to ensure consistent output structure.
 ---
 
 **Target:** DVWA @ `127.0.0.1:4280`
-**Time window:** 13:39 - 13:44 UTC (Feb 16, 2026)
+**Scope:** Last 25 requests (2026-02-16)
 **Authentication type:** Form-based authentication with CSRF protection
 
 ---

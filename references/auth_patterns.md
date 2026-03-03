@@ -1,6 +1,8 @@
 # Authentication Pattern Reference
 
-## Regex Patterns for Burp History Search
+## Regex Patterns for Item Classification
+
+These patterns are used to classify and extract data from downloaded history items.
 
 ### Login/Authentication Endpoints
 ```

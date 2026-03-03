@@ -2,43 +2,42 @@
 """
 Parse Burp Suite HTTP History JSON output files.
 
-Extracts authentication-related items, filters by time window,
-deduplicates, classifies each item, and outputs structured JSON.
+Extracts authentication-related items, deduplicates across multiple result
+files, classifies each item, and outputs structured JSON.
 
 Usage:
-    python3 parse_burp_history.py [--minutes M | --hours H] file1.txt [file2.txt ...]
-    python3 parse_burp_history.py --all file1.txt [file2.txt ...]
+    python3 parse_burp_history.py [--last N] file1.txt [file2.txt ...]
+
+    --last N  Keep only the last N items (most recent in fetch order).
+              Omit or use 0 to return all items.
 
 Output: JSON array of classified authentication flow items to stdout.
+        Summary stats to stderr.
 """
 
 import argparse
+import hashlib
 import json
 import re
 import sys
-from datetime import datetime, timedelta, timezone
-
-
-def parse_time_window(args):
-    """Return a UTC datetime cutoff based on CLI arguments."""
-    if args.all:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    minutes = 0
-    if args.hours:
-        minutes = args.hours * 60
-    if args.minutes:
-        minutes = args.minutes
-    if minutes == 0:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    return datetime.now(timezone.utc) - timedelta(minutes=minutes)
+from datetime import datetime, timezone
 
 
 def extract_items_from_file(filepath):
-    """Extract request/response pairs from a Burp MCP tool result file."""
-    with open(filepath) as f:
-        data = json.load(f)
+    """Extract request/response pairs from a Burp MCP tool result file.
 
-    text = data[0]["text"] if isinstance(data, list) else data.get("text", str(data))
+    Accepts two formats:
+    - JSON array: [{"type": "text", "text": "..."}]  (auto-saved by system)
+    - Raw text: item content written directly (manually saved inline results)
+    """
+    with open(filepath) as f:
+        raw = f.read()
+
+    try:
+        data = json.loads(raw)
+        text = data[0]["text"] if isinstance(data, list) else data.get("text", str(data))
+    except (json.JSONDecodeError, KeyError, IndexError):
+        text = raw
 
     pairs = re.findall(
         r'\{"request":"(.*?)","response":"(.*?)","notes":"(.*?)"\}',
@@ -49,7 +48,7 @@ def extract_items_from_file(filepath):
 
 
 def parse_date_header(response_text):
-    """Parse the Date header from a response into a UTC datetime."""
+    """Parse the Date header from a response into a UTC datetime, if present."""
     match = re.search(r"Date:\s*(.+?)\\r\\n", response_text)
     if not match:
         return None
@@ -178,8 +177,12 @@ def extract_cookie_flags(set_cookie_value):
     return flags
 
 
-def process_files(files, cutoff):
-    """Process all input files and return classified, deduplicated items."""
+def process_files(files):
+    """Process all input files and return classified, deduplicated items.
+
+    Items from multiple files are merged and deduplicated by request content
+    hash, preserving the original fetch order (oldest first within each file).
+    """
     all_pairs = []
     for filepath in files:
         try:
@@ -190,13 +193,15 @@ def process_files(files, cutoff):
 
     items = []
     seen_keys = set()
+    now = datetime.now(timezone.utc)
 
     for req, resp, notes in all_pairs:
-        dt = parse_date_header(resp)
-        if dt is not None and dt < cutoff:
+        # Dedup by request content hash — handles the same item appearing in
+        # multiple result files due to overlapping regex patterns.
+        dedup_key = hashlib.md5(req.encode()).hexdigest()
+        if dedup_key in seen_keys:
             continue
-        if dt is None:
-            dt = datetime.now(timezone.utc)
+        seen_keys.add(dedup_key)
 
         # Extract method and path
         method_match = re.match(r"(\w+)\s+(\S+)\s+HTTP", req)
@@ -213,11 +218,8 @@ def process_files(files, cutoff):
         host_match = re.search(r"Host:\s*(.+?)\\r\\n", req)
         host = host_match.group(1).strip() if host_match else "unknown"
 
-        # Dedup
-        key = f"{method}|{path}|{dt.isoformat()}"
-        if key in seen_keys:
-            continue
-        seen_keys.add(key)
+        # Timestamp — use Date header if present, otherwise script invocation time
+        dt = parse_date_header(resp) or now
 
         # Extract details
         set_cookies = extract_set_cookies(resp)
@@ -273,26 +275,19 @@ def process_files(files, cutoff):
             }
         )
 
-    items.sort(key=lambda x: x["timestamp"])
     return items
 
 
-def summarize(items):
-    """Print a human-readable summary alongside the JSON output."""
+def summarize(items, last):
+    """Print a human-readable summary to stderr and JSON to stdout."""
     if not items:
         print("NO_ITEMS_FOUND", file=sys.stderr)
-        if items is not None:
-            print("[]")
+        print("[]")
         return
 
-    # Date range
-    first = items[0]
-    last = items[-1]
-    print(
-        f"Date range: {first['date']} {first['time']} - {last['date']} {last['time']} UTC",
-        file=sys.stderr,
-    )
-    print(f"Total items: {len(items)}", file=sys.stderr)
+    scope = f"last {last}" if last else "all"
+    print(f"Scope    : {scope} items", file=sys.stderr)
+    print(f"Returned : {len(items)} items", file=sys.stderr)
 
     categories = {}
     for item in items:
@@ -300,27 +295,29 @@ def summarize(items):
         categories[cat] = categories.get(cat, 0) + 1
     print(f"Categories: {categories}", file=sys.stderr)
 
-    # Unique hosts
     hosts = set(item["host"] for item in items)
     print(f"Hosts: {hosts}", file=sys.stderr)
 
-    # Output JSON to stdout
     json.dump(items, sys.stdout, indent=2)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Parse Burp HTTP History for authentication flows")
+    parser = argparse.ArgumentParser(
+        description="Parse Burp HTTP History for authentication flows"
+    )
     parser.add_argument("files", nargs="+", help="Burp MCP tool result JSON files")
-    parser.add_argument("--minutes", "-m", type=int, help="Filter to last N minutes")
-    parser.add_argument("--hours", "-H", type=int, help="Filter to last N hours")
-    parser.add_argument("--all", "-a", action="store_true", help="Process all items (no time filter)")
+    parser.add_argument(
+        "--last", "-n", type=int, default=0,
+        help="Keep only the last N items in fetch order (0 = all, default: 0)"
+    )
     args = parser.parse_args()
 
-    cutoff = parse_time_window(args)
-    print(f"Cutoff: {cutoff.isoformat()}", file=sys.stderr)
+    items = process_files(args.files)
 
-    items = process_files(args.files, cutoff)
-    summarize(items)
+    if args.last > 0:
+        items = items[-args.last:]
+
+    summarize(items, args.last)
 
 
 if __name__ == "__main__":
