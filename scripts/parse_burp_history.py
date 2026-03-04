@@ -1,37 +1,107 @@
 #!/usr/bin/env python3
 """
-Parse Burp Suite HTTP History JSON output files.
+Parse Burp Suite HTTP History files.
 
 Extracts authentication-related items, deduplicates across multiple result
-files, classifies each item, and outputs structured JSON.
+files, classifies each item, and outputs either structured JSON or a
+pre-formatted markdown report.
 
 Usage:
-    python3 parse_burp_history.py [--last N] file1.txt [file2.txt ...]
+    python3 parse_burp_history.py [--last N] [--report] file1 [file2 ...]
 
-    --last N  Keep only the last N items (most recent in fetch order).
-              Omit or use 0 to return all items.
+    --last N    Keep only the last N items (most recent in fetch order).
+                Omit or use 0 to return all items.
+    --report    Output a pre-formatted markdown report (sequence diagram,
+                session table, CSRF table, findings) instead of JSON.
 
-Output: JSON array of classified authentication flow items to stdout.
-        Summary stats to stderr.
+Output (default): JSON array of classified items to stdout; summary to stderr.
+Output (--report): Formatted markdown report to stdout.
+
+Input formats accepted:
+    - Burp XML export  (<?xml ...> / <items> — local "Save items" export)
+    - JSON array       ([{"type": "text", "text": "..."}] — auto-saved by system)
+    - Raw text         (item content written inline)
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import re
 import sys
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 
-def extract_items_from_file(filepath):
-    """Extract request/response pairs from a Burp MCP tool result file.
+# ---------------------------------------------------------------------------
+# File parsing
+# ---------------------------------------------------------------------------
 
-    Accepts two formats:
+def _parse_xml_time(s):
+    """Parse Burp XML export timestamp: 'Sun Mar 01 15:18:29 EST 2026'.
+
+    Strips the timezone abbreviation and tries common strptime patterns.
+    Returns a UTC datetime (timezone offset is ignored — used for ordering only).
+    """
+    if not s:
+        return None
+    # Remove timezone abbreviation (EST, UTC, GMT, BST, …)
+    cleaned = re.sub(r'\s+[A-Z]{2,5}(?=\s)', ' ', s.strip())
+    for fmt in ("%a %b %d %H:%M:%S %Y", "%a %b  %d %H:%M:%S %Y"):
+        try:
+            return datetime.strptime(cleaned, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _extract_items_from_xml(raw):
+    """Extract request/response pairs from a Burp XML export ("Save items").
+
+    Decodes base64 request/response bodies and normalises line endings to the
+    escaped form (\\r\\n) expected by all downstream parsing functions.
+    Stores the Burp export timestamp in the notes field for correct ordering.
+    """
+    root = ET.fromstring(raw)
+    pairs = []
+    for item in root.findall("item"):
+        req_el = item.find("request")
+        resp_el = item.find("response")
+        if req_el is None or resp_el is None:
+            continue
+
+        req_text = req_el.text or ""
+        resp_text = resp_el.text or ""
+        time_str = item.findtext("time") or ""
+
+        if req_el.get("base64") == "true" and req_text:
+            req_text = base64.b64decode(req_text).decode("utf-8", errors="replace")
+        if resp_el.get("base64") == "true" and resp_text:
+            resp_text = base64.b64decode(resp_text).decode("utf-8", errors="replace")
+
+        # Normalise to the escaped form the rest of the script expects
+        req_text = req_text.replace("\r\n", "\\r\\n").replace("\n", "\\r\\n")
+        resp_text = resp_text.replace("\r\n", "\\r\\n").replace("\n", "\\r\\n")
+
+        pairs.append((req_text, resp_text, time_str))
+    # XML export is newest-first; reverse so oldest-first order is preserved
+    # through the timestamp sort (stable sort keeps relative order within a second)
+    return list(reversed(pairs))
+
+
+def extract_items_from_file(filepath):
+    """Extract request/response pairs from a Burp history file.
+
+    Accepts three formats:
+    - Burp XML export: <?xml ...> <items> (local "Save items" export)
     - JSON array: [{"type": "text", "text": "..."}]  (auto-saved by system)
     - Raw text: item content written directly (manually saved inline results)
     """
     with open(filepath) as f:
         raw = f.read()
+
+    if raw.lstrip().startswith("<?xml") or raw.lstrip().startswith("<items"):
+        return _extract_items_from_xml(raw)
 
     try:
         data = json.loads(raw)
@@ -46,6 +116,10 @@ def extract_items_from_file(filepath):
     )
     return pairs
 
+
+# ---------------------------------------------------------------------------
+# Parsing helpers
+# ---------------------------------------------------------------------------
 
 def parse_date_header(response_text):
     """Parse the Date header from a response into a UTC datetime, if present."""
@@ -66,11 +140,9 @@ def classify_item(method, path, status, location, set_cookies, body):
     path_lower = path.lower()
     location_lower = location.lower()
 
-    # Logout
     if "logout" in path_lower or "signout" in path_lower or "sign-out" in path_lower:
         return "Logout"
 
-    # Initial visit redirecting to login
     if (
         method == "GET"
         and path_lower in ("/", "/index.php", "/index.html", "/default.aspx")
@@ -79,11 +151,9 @@ def classify_item(method, path, status, location, set_cookies, body):
     ):
         return "Initial Visit / Redirect"
 
-    # Login page load
     if method == "GET" and "login" in path_lower and status == "200":
         return "Login Page Load"
 
-    # Credential submission
     if method == "POST" and ("login" in path_lower or "auth" in path_lower or "token" in path_lower):
         has_creds = bool(
             re.search(r"(username|password|email|user|passwd|credential)", body, re.I)
@@ -93,23 +163,18 @@ def classify_item(method, path, status, location, set_cookies, body):
         if "token" in path_lower:
             return "Token Exchange"
 
-    # MFA challenge
     if method in ("GET", "POST") and re.search(r"(mfa|2fa|otp|verify|challenge)", path_lower):
         return "MFA Challenge"
 
-    # OAuth/SSO callback
     if re.search(r"(callback|redirect_uri|authorize)", path_lower):
         return "OAuth/SSO Callback"
 
-    # Static assets
     if re.search(r"\.(css|js|png|jpg|jpeg|gif|ico|svg|woff2?|ttf|eot)$", path_lower):
         return "Static Asset"
 
-    # Post-auth page (authenticated GET returning 200)
     if method == "GET" and status == "200" and "login" not in path_lower:
         return "Post-Auth Page Load"
 
-    # Redirect after login
     if status in ("301", "302", "303", "307", "308"):
         return "Redirect"
 
@@ -135,6 +200,7 @@ def extract_session_ids(cookie_string):
         (r"JSESSIONID=([A-Fa-f0-9]+)", "JSESSIONID"),
         (r"ASP\.NET_SessionId=([^\s;]+)", "ASP.NET_SessionId"),
         (r"connect\.sid=([^\s;]+)", "connect.sid"),
+        (r"\bsession=([^\s;,]+)", "session"),
     ]:
         match = re.search(pattern, cookie_string)
         if match:
@@ -177,6 +243,10 @@ def extract_cookie_flags(set_cookie_value):
     return flags
 
 
+# ---------------------------------------------------------------------------
+# Item processing
+# ---------------------------------------------------------------------------
+
 def process_files(files):
     """Process all input files and return classified, deduplicated items.
 
@@ -196,32 +266,26 @@ def process_files(files):
     now = datetime.now(timezone.utc)
 
     for req, resp, notes in all_pairs:
-        # Dedup by request content hash — handles the same item appearing in
-        # multiple result files due to overlapping regex patterns.
         dedup_key = hashlib.md5(req.encode()).hexdigest()
         if dedup_key in seen_keys:
             continue
         seen_keys.add(dedup_key)
 
-        # Extract method and path
         method_match = re.match(r"(\w+)\s+(\S+)\s+HTTP", req)
         if not method_match:
             continue
         method = method_match.group(1)
         path = method_match.group(2)
 
-        # Status code
         status_match = re.match(r"HTTP/[\d.]+ (\d+)", resp)
         status = status_match.group(1) if status_match else "?"
 
-        # Host
         host_match = re.search(r"Host:\s*(.+?)\\r\\n", req)
         host = host_match.group(1).strip() if host_match else "unknown"
 
-        # Timestamp — use Date header if present, otherwise script invocation time
-        dt = parse_date_header(resp) or now
+        # Timestamp: Burp XML export time (notes) > HTTP Date header > now
+        dt = _parse_xml_time(notes) or parse_date_header(resp) or now
 
-        # Extract details
         set_cookies = extract_set_cookies(resp)
         cookies_sent = extract_cookie_header(req)
         location_match = re.search(r"Location:\s*(.+?)\\r\\n", resp)
@@ -235,7 +299,6 @@ def process_files(files):
         cred_params = extract_cred_params(body)
         category = classify_item(method, path, status, location, set_cookies, body)
 
-        # Session IDs
         session_ids_sent = extract_session_ids(cookies_sent)
         session_ids_set = {}
         cookie_flags = {}
@@ -245,7 +308,6 @@ def process_files(files):
             for sid_name in sids:
                 cookie_flags[sid_name] = extract_cookie_flags(sc)
 
-        # Mask password values
         masked_creds = []
         for name, val in cred_params:
             if name.lower() in ("password", "passwd"):
@@ -278,8 +340,272 @@ def process_files(files):
     return items
 
 
+# ---------------------------------------------------------------------------
+# Report generation
+# ---------------------------------------------------------------------------
+
+def generate_report(items, scope_desc, source_desc):
+    """Generate a pre-formatted markdown report with ASCII sequence diagram."""
+
+    STATIC_RE = re.compile(r'\.(gif|jpe?g|png|ico|css|woff2?|ttf|svg|js)(\?.*)?$', re.I)
+    WSA = 'web-security-academy.net'
+
+    def is_visible(item):
+        path = item['path'].split('?')[0]
+        if STATIC_RE.search(path):
+            return False
+        if WSA in item['host'] and item['path'].startswith('/academyLabHeader'):
+            return False
+        return True
+
+    def pick_session(id_dict, raw_cookies):
+        """Return the first session ID value from a parsed dict or raw Set-Cookie list."""
+        if id_dict.get('session'):
+            return id_dict['session']
+        for val in id_dict.values():
+            return val
+        for sc in (raw_cookies or []):
+            m = re.search(r'\bsession=([^\s;,]+)', sc, re.I)
+            if m:
+                return m.group(1)
+        return None
+
+    # Group by host, sort chronologically
+    hosts = {}
+    for item in items:
+        hosts.setdefault(item['host'], []).append(item)
+    for h in hosts:
+        hosts[h].sort(key=lambda x: x['timestamp'])
+
+    # Auth type classification
+    has_csrf_tokens = any(hf for item in items for hf in item['hidden_fields'])
+    has_mfa = any(item['category'] == 'MFA Challenge' for item in items)
+    has_oauth = any(item['category'] == 'OAuth/SSO Callback' for item in items)
+    if has_oauth:
+        auth_type = "OAuth/SSO-based authentication"
+    elif has_mfa:
+        auth_type = "Multi-factor authentication (MFA/2FA)"
+    elif has_csrf_tokens:
+        auth_type = "Form-based authentication with CSRF protection"
+    else:
+        auth_type = "Form-based authentication — no CSRF token detected"
+
+    out = [
+        f"**Source:** {source_desc}",
+        f"**Scope:** {scope_desc} · {len(items)} items · {len(hosts)} host(s)",
+        f"**Authentication type:** {auth_type}",
+        "",
+        "---",
+    ]
+
+    global_findings = []
+
+    for host, host_items in hosts.items():
+        visible = [i for i in host_items if is_visible(i)]
+        if not visible:
+            continue
+
+        out.append(f"\n## {host}")
+
+        # Build session lifecycle — two passes so counts are correct regardless
+        # of whether items arrived chronologically or newest-first.
+        sess_order = []    # session IDs in first-seen order
+        sess_info = {}     # sid -> {state, set_on, flags, count}
+
+        # Pass 1: register every session that was set in a response
+        for item in host_items:
+            sid = pick_session(item['session_ids_set'], item['set_cookies_raw'])
+            if sid and sid not in sess_info:
+                if item['category'] in ('Credential Submission', 'Token Exchange'):
+                    state = 'Authenticated'
+                elif item['category'] == 'Logout':
+                    state = 'Post-logout'
+                elif item['category'] == 'MFA Challenge':
+                    state = 'Pre-2FA'
+                else:
+                    state = 'Pre-auth'
+                flags_raw = next(
+                    (sc for sc in item['set_cookies_raw']
+                     if re.search(r'\bsession=', sc, re.I)
+                     or any(k in sc for k in ('PHPSESSID', 'JSESSIONID'))),
+                    ""
+                )
+                sess_info[sid] = {
+                    'state': state,
+                    'set_on': item['path'],
+                    'flags': flags_raw,
+                    'count': 0,
+                }
+                sess_order.append(sid)
+
+        # Pass 2: count how many requests each session was sent with
+        for item in host_items:
+            sent = pick_session(item['session_ids_sent'], [])
+            if sent and sent in sess_info:
+                sess_info[sent]['count'] += 1
+
+        # ---- ASCII Sequence Diagram ----
+        L = 52  # left column width
+        out += [
+            "",
+            "### Sequence Diagram",
+            "",
+            "```",
+            f"{'Browser':<{L}}Server",
+            f"  |{' ' * (L - 3)}|",
+        ]
+
+        for step, item in enumerate(visible, 1):
+            # Request annotations
+            req_lines = [f"{step}. {item['method']} {item['path']}"]
+
+            sent = pick_session(item['session_ids_sent'], [])
+            if sent:
+                req_lines.append(f"  Cookie: session={sent[:8]}...{sent[-4:]}")
+
+            for cp in item['cred_params']:
+                req_lines.append(f"  {cp['name']}={cp['value']}")
+
+            for line in req_lines:
+                out.append(f"  |  {line:<{L - 5}}|")
+            out.append(f"  |{'-' * (L - 4)}>|")
+
+            # Response annotations
+            resp_lines = []
+            if item['location']:
+                resp_lines.append(f"{item['status']} Found -> {item['location']}")
+            else:
+                resp_lines.append(f"{item['status']} OK")
+
+            set_sid = pick_session(item['session_ids_set'], item['set_cookies_raw'])
+            if set_sid:
+                resp_lines.append(f"Set-Cookie: session={set_sid[:8]}...{set_sid[-4:]}")
+                if item['category'] in ('Credential Submission', 'Token Exchange') and sent:
+                    resp_lines.append("(session rotated on login)")
+
+            for hf in item['hidden_fields']:
+                resp_lines.append(f"Hidden: {hf['name']}={hf['value'][:16]}...")
+
+            for line in resp_lines:
+                out.append(f"  |  {line:<{L - 5}}|")
+            out.append(f"  |<{'-' * (L - 4)}|")
+            out.append(f"  |{' ' * (L - 3)}|")
+
+        out.append("```")
+
+        # ---- Session Identifiers ----
+        out += ["", "### Session Identifiers", ""]
+        if sess_order:
+            out.append("| # | session | State | Set On | Requests |")
+            out.append("|---|---|---|---|---|")
+            for i, sid in enumerate(sess_order, 1):
+                info = sess_info[sid]
+                out.append(
+                    f"| {i} | `{sid}` | {info['state']} "
+                    f"| `{info['set_on']}` | {info['count']} |"
+                )
+
+            first_flags = sess_info[sess_order[0]]['flags']
+            flag_parts = []
+            if 'Secure' in first_flags:
+                flag_parts.append('`Secure` ✓')
+            if 'HttpOnly' in first_flags:
+                flag_parts.append('`HttpOnly` ✓')
+            m = re.search(r'SameSite=(\w+)', first_flags)
+            if m:
+                val = m.group(1)
+                emoji = '⚠️' if val == 'None' else ('✓' if val == 'Strict' else '~')
+                flag_parts.append(f'`SameSite={val}` {emoji}')
+            if flag_parts:
+                out.append(f"\n**Cookie flags:** {' · '.join(flag_parts)}")
+        else:
+            out.append("No session cookies observed.")
+
+        # ---- CSRF / Anti-Forgery Tokens ----
+        out += ["", "### CSRF / Anti-Forgery Tokens", ""]
+        csrf_pairs = [(item, hf) for item in host_items for hf in item['hidden_fields']]
+        if csrf_pairs:
+            out.append("| Token Name | Value | Found In | Submitted In |")
+            out.append("|---|---|---|---|")
+            for item, hf in csrf_pairs:
+                out.append(
+                    f"| `{hf['name']}` | `{hf['value'][:20]}` "
+                    f"| `{item['path']}` (hidden) | — |"
+                )
+        else:
+            out.append("No CSRF tokens detected.")
+
+        # ---- Per-host findings ----
+        CSRF_TOKEN_NAMES = ('csrf_token', 'user_token', '_token', 'authenticity_token')
+        for item in host_items:
+            if (
+                item['method'] == 'POST'
+                and item['category'] not in (
+                    'Credential Submission', 'Token Exchange', 'MFA Challenge'
+                )
+                and not any(
+                    hf['name'].lower() in CSRF_TOKEN_NAMES
+                    for hf in item['hidden_fields']
+                )
+            ):
+                global_findings.append(
+                    ('High', 'No CSRF protection',
+                     f"`{item['method']} {item['path']}`")
+                )
+
+        if any('SameSite=None' in sc for item in host_items for sc in item['set_cookies_raw']):
+            global_findings.append((
+                'Medium', '`SameSite=None` on session cookie',
+                'Cross-site requests carry the session — no browser CSRF barrier',
+            ))
+
+        for item in host_items:
+            if item['category'] == 'Credential Submission' and item['set_cookies_raw']:
+                global_findings.append((
+                    '✓ Good', 'Session rotation on login',
+                    f"New session issued on `POST {item['path']}`",
+                ))
+                break
+
+        sess_cookies = [
+            sc for item in host_items for sc in item['set_cookies_raw']
+            if re.search(r'\bsession=', sc, re.I)
+        ]
+        if sess_cookies and all(
+            'Secure' in sc and 'HttpOnly' in sc for sc in sess_cookies
+        ):
+            global_findings.append((
+                '✓ Good', '`Secure` + `HttpOnly` flags',
+                'All session cookies — prevents sniffing and JS theft',
+            ))
+
+    # Deduplicate findings (keep first occurrence)
+    seen_f: set = set()
+    deduped = []
+    for f in global_findings:
+        key = f[:2]
+        if key not in seen_f:
+            seen_f.add(key)
+            deduped.append(f)
+
+    out += ["", "## Notable Findings", ""]
+    if deduped:
+        out.append("| Risk | Finding | Detail |")
+        out.append("|---|---|---|")
+        for risk, title, detail in deduped:
+            out.append(f"| {risk} | **{title}** | {detail} |")
+    else:
+        out.append("No significant findings.")
+
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Output modes
+# ---------------------------------------------------------------------------
+
 def summarize(items, last):
-    """Print a human-readable summary to stderr and JSON to stdout."""
+    """Print summary stats to stderr and JSON array to stdout."""
     if not items:
         print("NO_ITEMS_FOUND", file=sys.stderr)
         print("[]")
@@ -305,10 +631,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Parse Burp HTTP History for authentication flows"
     )
-    parser.add_argument("files", nargs="+", help="Burp MCP tool result JSON files")
+    parser.add_argument("files", nargs="+", help="Burp history files (XML, JSON, or raw text)")
     parser.add_argument(
         "--last", "-n", type=int, default=0,
-        help="Keep only the last N items in fetch order (0 = all, default: 0)"
+        help="Keep only the last N items in fetch order (0 = all, default: 0)",
+    )
+    parser.add_argument(
+        "--report", action="store_true",
+        help="Output a pre-formatted markdown report instead of JSON",
     )
     args = parser.parse_args()
 
@@ -317,7 +647,18 @@ def main():
     if args.last > 0:
         items = items[-args.last:]
 
-    summarize(items, args.last)
+    if args.report:
+        if not items:
+            print("NO_ITEMS_FOUND", file=sys.stderr)
+            return
+        scope_desc = f"last {args.last}" if args.last else "all"
+        source_desc = (
+            args.files[0] if len(args.files) == 1
+            else f"{len(args.files)} files"
+        )
+        print(generate_report(items, scope_desc, source_desc))
+    else:
+        summarize(items, args.last)
 
 
 if __name__ == "__main__":

@@ -58,12 +58,12 @@ Browser                                        DVWA Server
 
 ## Session Identifiers
 
-| # | PHPSESSID | State | Used In | Context |
+| # | PHPSESSID | State | Set On | Requests |
 |---|---|---|---|---|
-| 1 | `95ce754a2f847d048fd4af2a2fa51211` | Pre-auth (post-logout) | 4 requests | Issued by `GET /logout.php` 302 response |
-| 2 | `ff91cf8b6f2491789cbdae695eed55e9` | Authenticated | 3 requests | Rotated on successful `POST /login.php` |
+| 1 | `95ce754a2f847d048fd4af2a2fa51211` | Pre-auth | `/logout.php` | 4 |
+| 2 | `ff91cf8b6f2491789cbdae695eed55e9` | Authenticated | `/login.php` | 3 |
 
-**Session lifecycle:** Logout destroys old session -> #1 issued (unauthenticated) -> Login rotates to #2 (authenticated)
+**Cookie flags:** `Secure` ✓ · `HttpOnly` ✓ · `SameSite=Lax` ✓
 
 ## CSRF / Anti-Forgery Tokens
 

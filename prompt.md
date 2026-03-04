@@ -4,18 +4,32 @@ Map and document authentication flows from Burp Suite HTTP History. Produce an A
 
 ## Workflow
 
-### Step 0: Ask for Scope
+### Step 0: Ask for Input Source and Scope
 
-Before fetching any history, use the AskUserQuestion tool to ask how many recent requests to analyse. Use exactly these four options:
+Use a **single** AskUserQuestion with these four options to select both source and scope in one step:
 
-- Last 25 requests
-- Last 50 requests
-- Last 100 requests
-- All in history
+- **Live — Last 50 requests** — fetch the 50 most recent items from the connected Burp MCP server
+- **Live — Last 100 requests** — fetch the 100 most recent items
+- **Live — All in history** — fetch the entire proxy history
+- **Local file** — analyse a Burp history XML file already saved on disk
 
-Map the selection to the `--last` flag: "Last 25" → `--last 25`, "Last 50" → `--last 50`, "Last 100" → `--last 100`, "All in history" → omit `--last` (returns everything).
+**If a "Live" option is selected:**
+
+Map to the `--last` flag: "Last 50" → `--last 50`, "Last 100" → `--last 100`, "All in history" → omit `--last`.
+
+Continue to **Step 1**.
+
+**If "Local file" is selected:**
+
+Use a second AskUserQuestion to ask for the filename. Present the question with the instruction that the user should type the filename or full path using the "Other" field (e.g. `burp_history.xml`, `/home/kali/exports/session.xml`).
+
+If the path starts with `/` or `~/`, expand `~` and check existence directly with `test -f`. Otherwise search with Bash `find` starting from the home directory and `/tmp`. If the file is not found, inform the user and stop.
+
+Once the file is located, skip **Step 1** entirely and proceed directly to **Step 2**, passing the located file path.
 
 ### Step 1: Download Full History to Local Files
+
+*(Skip this step if the user selected "Local file" in Step 0.)*
 
 Fetch the **entire** Burp HTTP History by paginating through `get_proxy_http_history` with `count: 200`. Never process results inline — always save every page to a local file first.
 
@@ -35,17 +49,18 @@ Collect every file path (auto-saved or manually written). Proceed to Step 2 once
 
 ### Step 2: Process with Script
 
-Run `scripts/parse_burp_history.py` once, passing all collected file paths. The script merges and deduplicates across files automatically:
+Run `scripts/parse_burp_history.py` once with the `--report` flag, passing all collected file paths:
 
 ```bash
-python3 scripts/parse_burp_history.py [--last N] <file1> [file2 ...]
+python3 scripts/parse_burp_history.py --report [--last N] <file1> [file2 ...]
 ```
 
-Map the user's scope to `--last`: "Last 25" → `--last 25`, "All in history" → omit the flag.
+- **Live Burp History mode:** apply `--last N` as mapped from Step 0. Pass all paginated `/tmp` files.
+- **Local file mode:** omit `--last`. Pass the located file path directly. Do not delete the file after processing (it belongs to the user).
 
-The script outputs structured JSON to stdout and summary stats to stderr. If the script reports `NO_ITEMS_FOUND` on stderr, inform the user.
+The script outputs a fully-formatted markdown report to stdout (sequence diagrams, session tables, CSRF table, findings). If the script prints `NO_ITEMS_FOUND` to stderr, inform the user.
 
-After the script completes, check file sizes and delete all temporary files:
+**Live Burp History only** — after the script completes, check file sizes and delete all temporary files:
 
 ```bash
 du -sh <file(s)>
@@ -54,28 +69,18 @@ rm <file(s)>
 
 Report the total size freed to the user.
 
-### Step 3: Generate Output
+### Step 3: Display Output
 
-Using the classified items from the script JSON output, generate these sections in order. Refer to `references/example_output.md` for exact formatting.
-
-**Header:** Target host, scope selected, and authentication type classification.
-
-**Section 1 — ASCII Sequence Diagram:** Show the Browser/Server interaction flow as a two-column diagram — do NOT include a Burp Proxy column. Refer to `references/example_output.md` for the exact diagram format. Exclude any requests whose path ends with the following extensions: `gif`, `jpg`, `png`, `ico`, `css`, `woff`, `woff2`, `ttf`, `svg`. If the target host contains `web-security-academy.net`, also exclude `GET /academyLabHeader` requests. Mask password values with `****`.
-
-**Section 2 — Session Identifiers:** Table of all unique session IDs with their lifecycle state (pre-auth, authenticated, post-logout), request count, and context.
-
-**Section 3 — CSRF / Anti-Forgery Tokens:** Table of tokens found in hidden fields and where they were submitted.
+Output the script's stdout verbatim. Do not reformat or regenerate any section — the script has already produced the complete report. Prepend a one-line target/date context header if it adds useful orientation for the user.
 
 ## Edge Case Handling
 
-- **No items found:** Inform the user and suggest selecting "All in history" scope
+- **No items found:** Inform the user and suggest selecting "All in history" scope or verifying the local file contains Burp history data
+- **Local file not found:** Inform the user the file could not be located and ask them to verify the filename or provide the full path
 - **No Burp MCP connection:** If `get_proxy_http_history` fails, inform the user to verify the Burp MCP server is running and connected
 - **Non-DVWA targets:** The skill works with any web application — classification and patterns are framework-agnostic
 - **Multiple hosts in history:** Group output by host if multiple targets are detected
 
-## Resources
+## Script Location
 
-- `scripts/parse_burp_history.py` — Deterministic parser for Burp history result files. Accepts multiple files, merges and deduplicates by request hash, classifies items, extracts session IDs and credentials. Handles both auto-saved (JSON array) and manually written (raw text) file formats. Run directly without loading into context.
-- `references/auth_patterns.md` — Regex patterns, classification rules, extraction checklists, and authentication flow type reference.
-- `references/security_checklist.md` — Full security evaluation criteria organized by category (transport, session, CSRF, credentials, errors, MFA, brute force, logout).
-- `references/example_output.md` — Real DVWA example output for consistent formatting reference.
+`scripts/parse_burp_history.py` — run via Bash in Step 2. Do not read into context.
