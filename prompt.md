@@ -17,7 +17,21 @@ Use a **single** AskUserQuestion with these four options to select both source a
 
 Map to the `--last` flag: "Last 50" → `--last 50`, "Last 100" → `--last 100`, "All in history" → omit `--last`.
 
-Continue to **Step 1**.
+**Before continuing, perform a Burp MCP connectivity check:**
+
+Call `get_proxy_http_history` with `count: 1, offset: 0`. Any response — including `"Reached end of items"` — confirms the server is reachable. If the call throws an error or fails to respond, stop immediately and display this message:
+
+> **Burp MCP server is not reachable.**
+>
+> The skill cannot fetch proxy history. Please check the following:
+> - Burp Suite is running
+> - The Burp MCP extension is installed and enabled (Extensions → Installed)
+> - The MCP server is started inside Burp (look for the MCP tab or extension status)
+> - The MCP server is connected in Claude Code (run `/mcp` to verify)
+>
+> Once Burp is running and the MCP server is connected, run `/burp-authentication-mapper` again.
+
+If the check passes, continue to **Step 1**.
 
 **If "Local file" is selected:**
 
@@ -73,11 +87,38 @@ Report the total size freed to the user.
 
 Output the script's stdout verbatim. Do not reformat or regenerate any section — the script has already produced the complete report. Prepend a one-line target/date context header if it adds useful orientation for the user.
 
+### Step 4: Security Assessment
+
+After displaying the report, read `references/security_checklist.md` and evaluate the captured authentication flow against every check in the file. Use only evidence present in the report output — do not infer or assume behaviour that wasn't observed.
+
+Output a `## Security Assessment` section with one table per checklist category. Each table has three columns: **Check**, **Result**, **Notes**.
+
+**Result values:**
+- `✅ Pass` — evidence in the report confirms the good condition
+- `❌ Fail` — evidence in the report confirms the bad condition
+- `⚠️ Cannot determine` — insufficient data in the captured history to evaluate
+
+**Notes** should cite the specific request, response header, cookie flag, or token observed. Keep notes concise (one line).
+
+Evaluate all eight categories from the checklist:
+1. Transport Security
+2. Session Management
+3. CSRF Protection
+4. Credential Handling
+5. Error Handling
+6. Multi-Factor Authentication
+7. Brute Force Protection
+8. Logout Security
+
+After the tables, add a brief `### Summary` with:
+- Total Pass / Fail / Cannot determine counts
+- The two or three highest-priority issues to address (Fail items, ranked by risk)
+
 ## Edge Case Handling
 
 - **No items found:** Inform the user and suggest selecting "All in history" scope or verifying the local file contains Burp history data
 - **Local file not found:** Inform the user the file could not be located and ask them to verify the filename or provide the full path
-- **No Burp MCP connection:** If `get_proxy_http_history` fails, inform the user to verify the Burp MCP server is running and connected
+- **No Burp MCP connection:** Caught by the pre-flight check in Step 0 — stop immediately and display the detailed error message with troubleshooting steps
 - **Non-DVWA targets:** The skill works with any web application — classification and patterns are framework-agnostic
 - **Multiple hosts in history:** Group output by host if multiple targets are detected
 

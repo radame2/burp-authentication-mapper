@@ -6,9 +6,11 @@ A [Claude Code](https://claude.ai/code) skill that maps authentication flows fro
 
 Downloads the full Burp HTTP History from the Burp Suite proxy, classifies each request into a flow step, and produces:
 
-- **ASCII sequence diagram** — Browser ↔ Server interaction with credential masking; static assets (`.gif`, `.jpg`, `.png`, `.ico`, `.css`, `.woff`, `.woff2`, `.ttf`, `.svg`) are excluded; on PortSwigger Web Security Academy labs (`web-security-academy.net`), `GET /academyLabHeader` WebSocket upgrade requests are also excluded
-- **Session identifier table** — lifecycle state (pre-auth / authenticated / post-logout), request counts, and context for each unique session cookie
-- **CSRF / anti-forgery token table** — where tokens are issued and where they are submitted
+- **ASCII sequence diagram** — Browser ↔ Server interaction with credential masking. Hosts with no auth identifiers are omitted entirely. On hosts that do carry auth traffic, only steps that include a session cookie, auth token, or CSRF field are shown — unauthenticated and preflight requests are suppressed. Static assets (`.gif`, `.jpg`, `.png`, `.ico`, `.css`, `.woff`, `.woff2`, `.ttf`, `.svg`) are always excluded. On PortSwigger Web Security Academy labs (`web-security-academy.net`), `GET /academyLabHeader` requests are also excluded.
+- **Session identifier table** — lifecycle state (pre-auth / authenticated / post-logout), request counts, and cookie security flags (`Secure`, `HttpOnly`, `SameSite`) for each unique session cookie
+- **Token identifier table** — auth tokens issued in JSON response bodies and carried in request headers (`X-Token`, `Authorization`, `X-Auth-Token`, etc.), with issuance endpoint, request count, and which headers carried them. Tokens seen in requests but not in any captured response are tracked as orphaned entries.
+- **CSRF / anti-forgery token table** — where tokens are issued (hidden form fields) and where they are submitted
+- **Security assessment** — evaluates the captured flow against a structured checklist covering 8 categories: Transport Security, Session Management, CSRF Protection, Credential Handling, Error Handling, Multi-Factor Authentication, Brute Force Protection, and Logout Security. Each check is rated ✅ Pass, ❌ Fail, or ⚠️ Cannot determine, with evidence citations from the captured traffic.
 
 Works with any web application: form-based login, JWT/OAuth2 token flows, MFA challenges, SSO callbacks, and more.
 
@@ -155,10 +157,11 @@ burp-authentication-mapper/
 
 The core skill definition. Defines the workflow Claude follows when the skill is invoked:
 
-- **Step 0** — Single `AskUserQuestion` to select source and scope: Live (last 50/100/all) or Local XML file
+- **Step 0** — Single `AskUserQuestion` to select source and scope: Live (last 50/100/all) or Local XML file. For Live mode, performs a Burp MCP connectivity pre-flight check before proceeding — stops immediately with troubleshooting guidance if the server is unreachable.
 - **Step 1** — *(Live mode only)* Downloads the full Burp HTTP History by paginating through `get_proxy_http_history` (count: 200 per page); saves every page to a local temp file — never processes results inline
 - **Step 2** — Runs `parse_burp_history.py --report` with all collected file paths (or the local XML path); the script merges, deduplicates, classifies items, and outputs a complete formatted report; cleans up temp files and reports space freed (live mode only)
 - **Step 3** — Displays the script's stdout verbatim — no regeneration
+- **Step 4** — Security Assessment: reads `references/security_checklist.md` and evaluates the captured flow against all 8 checklist categories using only evidence from the report; outputs per-category tables with Pass/Fail/Cannot determine ratings and a ranked summary of top issues
 
 ### `scripts/parse_burp_history.py`
 
@@ -170,9 +173,13 @@ A deterministic Python 3 parser for Burp history files. Run directly — never l
 - Optionally limits to the last N items (`--last N`) to match the selected scope
 - Classifies each item into an auth flow category (Login Page Load, Credential Submission, Post-Auth Page Load, Static Asset, Logout, etc.)
 - Extracts session cookies sent and set, with full security flag details (HttpOnly, Secure, SameSite, Max-Age, Domain, Path)
+- Extracts auth tokens from JSON response bodies via a configurable field registry (`RESPONSE_TOKEN_FIELDS`); handles both XML-export and MCP-JSON line-ending formats
+- Extracts auth tokens from request headers via a configurable header registry (`AUTH_REQUEST_HEADERS`); strips scheme prefixes (Bearer/Basic/Token) from Authorization automatically
+- Tracks token lifecycle: matches issued tokens to header usage, with orphaned-token fallback for tokens seen in requests but not in any captured response
 - Extracts hidden form fields and CSRF tokens from response HTML
 - Extracts credential parameters from POST bodies with password masking (`****`)
-- `--report` mode outputs a fully-formatted markdown report (sequence diagram, session table, CSRF table, notable findings) directly to stdout — no Claude generation needed
+- Filters output: hosts with no auth identifiers are omitted; per-host diagrams show only steps carrying session cookies, tokens, or CSRF fields
+- `--report` mode outputs a fully-formatted markdown report (sequence diagram, session table, token table, CSRF table, notable findings) directly to stdout — no Claude generation needed
 
 **Usage:**
 ```bash

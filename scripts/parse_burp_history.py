@@ -34,6 +34,41 @@ from datetime import datetime, timezone
 
 
 # ---------------------------------------------------------------------------
+# Configurable token registries  (extend these lists to support new tokens)
+# ---------------------------------------------------------------------------
+
+# JSON field names to search for in response bodies (top-level and one level
+# deep inside nested objects).  Add new field names here as APIs evolve.
+RESPONSE_TOKEN_FIELDS = [
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "jwt",
+    "bearer_token",
+    "session_token",
+    "api_key",
+    "apikey",
+]
+
+# HTTP request header names that carry an auth token.  Matched
+# case-insensitively.  For "Authorization", the scheme prefix
+# (Bearer / Basic / Token) is stripped automatically.  Add new header
+# names here as custom APIs introduce them.
+AUTH_REQUEST_HEADERS = [
+    "Authorization",
+    "X-Token",
+    "X-Auth-Token",
+    "X-Access-Token",
+    "X-Session-Token",
+    "X-API-Key",
+    "Api-Key",
+    "Token",
+]
+
+
+# ---------------------------------------------------------------------------
 # File parsing
 # ---------------------------------------------------------------------------
 
@@ -227,6 +262,67 @@ def extract_cred_params(body):
     return params
 
 
+def extract_response_body_tokens(response_text):
+    """Extract auth tokens from a JSON response body.
+
+    Searches RESPONSE_TOKEN_FIELDS in the top-level JSON object and one level
+    deep inside any nested objects.  Returns a dict mapping field_name -> value.
+    Add new field names to RESPONSE_TOKEN_FIELDS to extend coverage.
+
+    Handles both escaped (\\r\\n as 4 chars) and literal (CR+LF as 2 chars)
+    line endings so the same function works for XML-export and MCP-JSON inputs.
+    """
+    tokens = {}
+    body = ""
+    for sep in ("\\r\\n\\r\\n", "\r\n\r\n", "\n\n"):
+        if sep in response_text:
+            body = response_text.split(sep, 1)[1]
+            break
+    if not body.strip():
+        return tokens
+    # When the body was captured via regex from an MCP-format JSON file the
+    # quotes inside the JSON body are still escaped as \" — unescape them so
+    # json.loads can parse the object correctly.  This is a no-op for bodies
+    # that already contain literal quote characters (e.g. XML-export format).
+    body = body.replace('\\"', '"').replace('\\\\', '\\')
+    try:
+        data = json.loads(body)
+    except (json.JSONDecodeError, ValueError):
+        return tokens
+    if not isinstance(data, dict):
+        return tokens
+
+    def _scan(obj):
+        for field in RESPONSE_TOKEN_FIELDS:
+            if field in obj and isinstance(obj[field], str) and obj[field]:
+                tokens.setdefault(field, obj[field])
+
+    _scan(data)
+    for val in data.values():
+        if isinstance(val, dict):
+            _scan(val)
+    return tokens
+
+
+def extract_auth_request_headers(request_text):
+    """Extract auth token values from request headers defined in AUTH_REQUEST_HEADERS.
+
+    Returns a dict mapping header_name -> value.  For the Authorization header
+    the scheme prefix (Bearer / Basic / Token) is stripped so only the credential
+    value is stored.  Add new header names to AUTH_REQUEST_HEADERS to extend
+    coverage.
+    """
+    found = {}
+    for header in AUTH_REQUEST_HEADERS:
+        match = re.search(rf"(?i){re.escape(header)}:\s*(.+?)\\r\\n", request_text)
+        if match:
+            value = match.group(1).strip()
+            if header.lower() == "authorization":
+                value = re.sub(r"^(?:Bearer|Basic|Token)\s+", "", value, flags=re.I)
+            found[header] = value
+    return found
+
+
 def extract_cookie_flags(set_cookie_value):
     """Extract security flags from a Set-Cookie header value."""
     flags = {}
@@ -241,6 +337,23 @@ def extract_cookie_flags(set_cookie_value):
     path = re.search(r"[Pp]ath=([^;\s]+)", set_cookie_value)
     flags["Path"] = path.group(1) if path else None
     return flags
+
+
+def item_has_auth_identifiers(item):
+    """Return True if the item carries any session cookie, auth token, or CSRF field.
+
+    Used to decide whether a diagram step is worth showing on hosts that have
+    at least some auth traffic, and to decide whether to render the three
+    identifier sections at all for a given host.
+    """
+    return bool(
+        item['session_ids_sent']
+        or item['session_ids_set']
+        or item['set_cookies_raw']
+        or item.get('auth_request_headers')
+        or item.get('response_tokens')
+        or item['hidden_fields']
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -291,6 +404,8 @@ def process_files(files):
         location_match = re.search(r"Location:\s*(.+?)\\r\\n", resp)
         location = location_match.group(1).strip() if location_match else ""
         hidden_fields = extract_hidden_fields(resp)
+        response_tokens = extract_response_body_tokens(resp)
+        auth_request_headers = extract_auth_request_headers(req)
 
         body = ""
         if "\\r\\n\\r\\n" in req:
@@ -334,6 +449,8 @@ def process_files(files):
                     {"name": n, "value": v} for n, v in hidden_fields
                 ],
                 "cred_params": masked_creds,
+                "response_tokens": response_tokens,
+                "auth_request_headers": auth_request_headers,
             }
         )
 
@@ -381,10 +498,13 @@ def generate_report(items, scope_desc, source_desc):
     has_csrf_tokens = any(hf for item in items for hf in item['hidden_fields'])
     has_mfa = any(item['category'] == 'MFA Challenge' for item in items)
     has_oauth = any(item['category'] == 'OAuth/SSO Callback' for item in items)
+    has_response_tokens = any(item.get('response_tokens') for item in items)
     if has_oauth:
         auth_type = "OAuth/SSO-based authentication"
     elif has_mfa:
         auth_type = "Multi-factor authentication (MFA/2FA)"
+    elif has_response_tokens:
+        auth_type = "Token-based authentication (stateless / header token)"
     elif has_csrf_tokens:
         auth_type = "Form-based authentication with CSRF protection"
     else:
@@ -404,6 +524,15 @@ def generate_report(items, scope_desc, source_desc):
         visible = [i for i in host_items if is_visible(i)]
         if not visible:
             continue
+
+        # Skip hosts that have no auth identifiers at all — nothing meaningful
+        # to show for them (no tokens, cookies, or CSRF fields anywhere).
+        host_has_auth = any(item_has_auth_identifiers(i) for i in host_items)
+        if not host_has_auth:
+            continue
+
+        # Filter the diagram to only steps that carry at least one identifier.
+        diagram_items = [i for i in visible if item_has_auth_identifiers(i)]
 
         out.append(f"\n## {host}")
 
@@ -444,6 +573,51 @@ def generate_report(items, scope_desc, source_desc):
             if sent and sent in sess_info:
                 sess_info[sent]['count'] += 1
 
+        # Token lifecycle — pass 1: register every token issued in a response body
+        token_order = []   # field names in first-seen order
+        token_info = {}    # field -> {value, display, set_on, count, used_via}
+
+        for item in host_items:
+            for field, value in item.get('response_tokens', {}).items():
+                if field not in token_info:
+                    display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
+                    token_info[field] = {
+                        'value': value,
+                        'display': display,
+                        'set_on': item['path'],
+                        'count': 0,
+                        'used_via': set(),
+                    }
+                    token_order.append(field)
+
+        # Token lifecycle — pass 2: count requests that carry each token.
+        # If a token appears in a request header but was not found in any captured
+        # response body, register it as an orphaned entry so it still appears in
+        # the Token Identifiers table (origin marked as "not captured in history").
+        for item in host_items:
+            for header, value in item.get('auth_request_headers', {}).items():
+                matched = False
+                for field in token_order:
+                    if token_info[field]['value'] == value:
+                        token_info[field]['count'] += 1
+                        token_info[field]['used_via'].add(header)
+                        matched = True
+                if not matched:
+                    # Orphaned token — seen in request headers, origin not captured
+                    orphan_key = f"_orphan_{value[:16]}"
+                    if orphan_key not in token_info:
+                        display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
+                        token_info[orphan_key] = {
+                            'value': value,
+                            'display': display,
+                            'set_on': '(not captured in history)',
+                            'count': 0,
+                            'used_via': set(),
+                        }
+                        token_order.append(orphan_key)
+                    token_info[orphan_key]['count'] += 1
+                    token_info[orphan_key]['used_via'].add(header)
+
         # ---- ASCII Sequence Diagram ----
         L = 52  # left column width
         out += [
@@ -455,13 +629,17 @@ def generate_report(items, scope_desc, source_desc):
             f"  |{' ' * (L - 3)}|",
         ]
 
-        for step, item in enumerate(visible, 1):
+        for step, item in enumerate(diagram_items, 1):
             # Request annotations
             req_lines = [f"{step}. {item['method']} {item['path']}"]
 
             sent = pick_session(item['session_ids_sent'], [])
             if sent:
                 req_lines.append(f"  Cookie: session={sent[:8]}...{sent[-4:]}")
+
+            for header, value in item.get('auth_request_headers', {}).items():
+                display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
+                req_lines.append(f"  {header}: {display}")
 
             for cp in item['cred_params']:
                 req_lines.append(f"  {cp['name']}={cp['value']}")
@@ -483,6 +661,10 @@ def generate_report(items, scope_desc, source_desc):
                 if item['category'] in ('Credential Submission', 'Token Exchange') and sent:
                     resp_lines.append("(session rotated on login)")
 
+            for field, value in item.get('response_tokens', {}).items():
+                display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
+                resp_lines.append(f"token ({field}): {display}")
+
             for hf in item['hidden_fields']:
                 resp_lines.append(f"Hidden: {hf['name']}={hf['value'][:16]}...")
 
@@ -493,47 +675,74 @@ def generate_report(items, scope_desc, source_desc):
 
         out.append("```")
 
-        # ---- Session Identifiers ----
-        out += ["", "### Session Identifiers", ""]
-        if sess_order:
-            out.append("| # | session | State | Set On | Requests |")
-            out.append("|---|---|---|---|---|")
-            for i, sid in enumerate(sess_order, 1):
-                info = sess_info[sid]
-                out.append(
-                    f"| {i} | `{sid}` | {info['state']} "
-                    f"| `{info['set_on']}` | {info['count']} |"
-                )
+        # ---- Session Identifiers / Token Identifiers / CSRF ----
+        # Only rendered when the host has at least one auth identifier; if every
+        # request and response for this host is unauthenticated these three
+        # sections are suppressed entirely to keep the report clean.
+        if host_has_auth:
+            # Session Identifiers
+            out += ["", "### Session Identifiers", ""]
+            if sess_order:
+                out.append("| # | session | State | Set On | Requests |")
+                out.append("|---|---|---|---|---|")
+                for i, sid in enumerate(sess_order, 1):
+                    info = sess_info[sid]
+                    out.append(
+                        f"| {i} | `{sid}` | {info['state']} "
+                        f"| `{info['set_on']}` | {info['count']} |"
+                    )
 
-            first_flags = sess_info[sess_order[0]]['flags']
-            flag_parts = []
-            if 'Secure' in first_flags:
-                flag_parts.append('`Secure` ✓')
-            if 'HttpOnly' in first_flags:
-                flag_parts.append('`HttpOnly` ✓')
-            m = re.search(r'SameSite=(\w+)', first_flags)
-            if m:
-                val = m.group(1)
-                emoji = '⚠️' if val == 'None' else ('✓' if val == 'Strict' else '~')
-                flag_parts.append(f'`SameSite={val}` {emoji}')
-            if flag_parts:
-                out.append(f"\n**Cookie flags:** {' · '.join(flag_parts)}")
-        else:
-            out.append("No session cookies observed.")
+                first_flags = sess_info[sess_order[0]]['flags']
+                flag_parts = []
+                if 'Secure' in first_flags:
+                    flag_parts.append('`Secure` ✓')
+                if 'HttpOnly' in first_flags:
+                    flag_parts.append('`HttpOnly` ✓')
+                m = re.search(r'SameSite=(\w+)', first_flags)
+                if m:
+                    val = m.group(1)
+                    emoji = '⚠️' if val == 'None' else ('✓' if val == 'Strict' else '~')
+                    flag_parts.append(f'`SameSite={val}` {emoji}')
+                if flag_parts:
+                    out.append(f"\n**Cookie flags:** {' · '.join(flag_parts)}")
+            else:
+                out.append("No session cookies observed.")
 
-        # ---- CSRF / Anti-Forgery Tokens ----
-        out += ["", "### CSRF / Anti-Forgery Tokens", ""]
-        csrf_pairs = [(item, hf) for item in host_items for hf in item['hidden_fields']]
-        if csrf_pairs:
-            out.append("| Token Name | Value | Found In | Submitted In |")
-            out.append("|---|---|---|---|")
-            for item, hf in csrf_pairs:
-                out.append(
-                    f"| `{hf['name']}` | `{hf['value'][:20]}` "
-                    f"| `{item['path']}` (hidden) | — |"
-                )
-        else:
-            out.append("No CSRF tokens detected.")
+            # Token Identifiers
+            out += ["", "### Token Identifiers", ""]
+            if token_order:
+                out.append("| # | Field | Value | Issued On | Requests | Via Header |")
+                out.append("|---|---|---|---|---|---|")
+                for i, field in enumerate(token_order, 1):
+                    info = token_info[field]
+                    # For orphaned tokens, derive the field label from the headers
+                    # that carried it (known only after pass 2 completes).
+                    if field.startswith("_orphan_"):
+                        display_field = " / ".join(sorted(info['used_via'])) if info['used_via'] else "token"
+                    else:
+                        display_field = field
+                    via = ", ".join(f"`{h}`" for h in sorted(info['used_via'])) if info['used_via'] else "—"
+                    issued = info['set_on'] if info['set_on'].startswith('(') else f"`{info['set_on']}`"
+                    out.append(
+                        f"| {i} | `{display_field}` | `{info['display']}` "
+                        f"| {issued} | {info['count']} | {via} |"
+                    )
+            else:
+                out.append("No response body tokens detected.")
+
+            # CSRF / Anti-Forgery Tokens
+            out += ["", "### CSRF / Anti-Forgery Tokens", ""]
+            csrf_pairs = [(item, hf) for item in host_items for hf in item['hidden_fields']]
+            if csrf_pairs:
+                out.append("| Token Name | Value | Found In | Submitted In |")
+                out.append("|---|---|---|---|")
+                for item, hf in csrf_pairs:
+                    out.append(
+                        f"| `{hf['name']}` | `{hf['value'][:20]}` "
+                        f"| `{item['path']}` (hidden) | — |"
+                    )
+            else:
+                out.append("No CSRF tokens detected.")
 
         # ---- Per-host findings ----
         CSRF_TOKEN_NAMES = ('csrf_token', 'user_token', '_token', 'authenticity_token')
