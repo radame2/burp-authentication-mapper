@@ -280,3 +280,9 @@ Browser                                             Server
 |---|---|---|---|
 | `user_token` | `f970eb7fb77d44d785014b94d6c980f1` | `GET /login.php` (hidden field) | `POST /login.php` (form body) |
 ```
+
+---
+
+## License
+
+MIT — see [LICENSE](LICENSE) for details.

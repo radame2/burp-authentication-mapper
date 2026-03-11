@@ -49,7 +49,7 @@ Classify each HTTP history item into one of these categories based on the indica
 - Credential parameters (field names only — mask values with `****` for passwords)
 - CSRF/anti-forgery tokens (field names and values)
 - Session cookies sent (Cookie header)
-- Auth token headers — matched against `AUTH_REQUEST_HEADERS` registry: `Authorization` (Bearer/Basic/Token prefix stripped), `X-Token`, `X-Auth-Token`, `X-Access-Token`, `X-Session-Token`, `X-API-Key`, `Api-Key`, `Token`
+- Authorization headers (Basic, Bearer, etc.)
 - Content-Type (form-urlencoded vs multipart vs JSON)
 
 ### From Responses
@@ -59,9 +59,7 @@ Classify each HTTP history item into one of these categories based on the indica
 - Hidden form fields in HTML (especially CSRF tokens)
 - Error messages indicating auth failure
 - `WWW-Authenticate` headers (Basic/Digest auth)
-- JSON response body token fields — matched against `RESPONSE_TOKEN_FIELDS` registry: `token`, `access_token`, `refresh_token`, `id_token`, `auth_token`, `jwt`, `bearer_token`, `session_token`, `api_key`, `apikey` (searched top-level and one level deep)
-
-Both registries are defined at the top of `parse_burp_history.py` — add new field or header names there to extend coverage without modifying any other code.
+- JSON response bodies with token fields (access_token, refresh_token, expires_in)
 
 ### Session Tracking
 - Map each unique session ID value to its lifecycle state (pre-auth, authenticated, post-logout)
@@ -77,10 +75,10 @@ Both registries are defined at the top of `parse_burp_history.py` — add new fi
 3. New session cookie set in redirect response
 4. GET authenticated page with new session
 
-### Token-Based (JWT/OAuth2 / Custom Header)
+### Token-Based (JWT/OAuth2)
 1. POST credentials to token endpoint
-2. Receive token in JSON response body — field name varies by app (`token`, `access_token`, `jwt`, etc. — see `RESPONSE_TOKEN_FIELDS` in `parse_burp_history.py`)
-3. Subsequent requests carry the token in a request header — header name varies by app (`Authorization: Bearer <token>`, `X-Token`, `X-Auth-Token`, etc. — see `AUTH_REQUEST_HEADERS` in `parse_burp_history.py`)
+2. Receive access_token + refresh_token in JSON response body
+3. Subsequent requests include `Authorization: Bearer <token>`
 
 ### Multi-Factor Authentication (MFA)
 1. POST primary credentials → 200/302 to MFA challenge
