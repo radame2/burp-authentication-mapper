@@ -7,12 +7,13 @@ files, classifies each item, and outputs either structured JSON or a
 pre-formatted markdown report.
 
 Usage:
-    python3 parse_burp_history.py [--last N] [--report] file1 [file2 ...]
+    python3 parse_burp_history.py [--last N] [--report] [--version] file1 [file2 ...]
 
-    --last N    Keep only the last N items (most recent in fetch order).
-                Omit or use 0 to return all items.
-    --report    Output a pre-formatted markdown report (sequence diagram,
-                session table, CSRF table, findings) instead of JSON.
+    --last N      Keep only the last N items (most recent in fetch order).
+                  Omit or use 0 to return all items.
+    --report      Output a pre-formatted markdown report (sequence diagram,
+                  session table, CSRF table, findings) instead of JSON.
+    --version     Print version and changelog, then exit.
 
 Output (default): JSON array of classified items to stdout; summary to stderr.
 Output (--report): Formatted markdown report to stdout.
@@ -33,12 +34,44 @@ import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 
 
+VERSION = "2.0.0"
+
+CHANGELOG = """
+v2.0.0 (2026-03-12)
+  - Replaced allowlist-based session cookie detection (extract_session_ids) with a
+    generic parse-all approach: every Set-Cookie header is now parsed and classified
+    by purpose using flag heuristics and value shape, not cookie name.
+  - Cookie classification kinds:
+      session  — HttpOnly=true, not long-lived (typical server-side session)
+      jwt      — value matches eyJ...eyJ JWT structure
+      device   — Max-Age > 30 days (persistent device/tracking cookie)
+      csrf     — name matches csrf/xsrf/forgery, or non-HttpOnly + high-entropy
+                 value (double-submit cookie pattern)
+      other    — everything else
+  - XSRF-TOKEN and other CSRF cookies delivered via Set-Cookie are now shown
+    in the CSRF / Anti-Forgery Tokens section alongside hidden form fields.
+  - Custom session cookie names (e.g. hack_the_box_session, laravel_session,
+    global_device_cookie_*) are tracked automatically without registration.
+  - Cookie request header is now parsed generically — all name=value pairs
+    extracted, not just those matching a fixed list of known names.
+  - Session Identifiers table renamed to "Session & Cookie Identifiers" and
+    now lists every session/jwt/device cookie with per-cookie flag annotations
+    (HttpOnly, Secure, SameSite, Max-Age).
+  - Fixed: HttpOnly, Secure, SameSite, and Max-Age flag detection is now
+    case-insensitive (previously missed lowercase directive values).
+  - Added --version flag to print version and changelog.
+
+v1.0.0
+  - Initial release.
+"""
+
+
 # ---------------------------------------------------------------------------
 # Configurable token registries  (extend these lists to support new tokens)
 # ---------------------------------------------------------------------------
 
 # JSON field names to search for in response bodies (top-level and one level
-# deep inside nested objects).  Add new field names here as APIs evolve.
+# deep inside nested objects).
 RESPONSE_TOKEN_FIELDS = [
     "token",
     "access_token",
@@ -52,10 +85,7 @@ RESPONSE_TOKEN_FIELDS = [
     "apikey",
 ]
 
-# HTTP request header names that carry an auth token.  Matched
-# case-insensitively.  For "Authorization", the scheme prefix
-# (Bearer / Basic / Token) is stripped automatically.  Add new header
-# names here as custom APIs introduce them.
+# HTTP request header names that carry an auth token.
 AUTH_REQUEST_HEADERS = [
     "Authorization",
     "X-Token",
@@ -80,7 +110,6 @@ def _parse_xml_time(s):
     """
     if not s:
         return None
-    # Remove timezone abbreviation (EST, UTC, GMT, BST, …)
     cleaned = re.sub(r'\s+[A-Z]{2,5}(?=\s)', ' ', s.strip())
     for fmt in ("%a %b %d %H:%M:%S %Y", "%a %b  %d %H:%M:%S %Y"):
         try:
@@ -114,13 +143,10 @@ def _extract_items_from_xml(raw):
         if resp_el.get("base64") == "true" and resp_text:
             resp_text = base64.b64decode(resp_text).decode("utf-8", errors="replace")
 
-        # Normalise to the escaped form the rest of the script expects
         req_text = req_text.replace("\r\n", "\\r\\n").replace("\n", "\\r\\n")
         resp_text = resp_text.replace("\r\n", "\\r\\n").replace("\n", "\\r\\n")
 
         pairs.append((req_text, resp_text, time_str))
-    # XML export is newest-first; reverse so oldest-first order is preserved
-    # through the timestamp sort (stable sort keeps relative order within a second)
     return list(reversed(pairs))
 
 
@@ -170,7 +196,7 @@ def parse_date_header(response_text):
         return None
 
 
-def classify_item(method, path, status, location, set_cookies, body):
+def classify_item(method, path, status, location, body):
     """Classify an HTTP history item into an authentication flow category."""
     path_lower = path.lower()
     location_lower = location.lower()
@@ -216,31 +242,94 @@ def classify_item(method, path, status, location, set_cookies, body):
     return "Other"
 
 
-def extract_set_cookies(response_text):
-    """Extract all Set-Cookie header values from a response."""
-    return re.findall(r"Set-Cookie:\s*(.+?)\\r\\n", response_text)
+def extract_cookie_flags(set_cookie_value):
+    """Extract security flags from a Set-Cookie header value.
+
+    All directive names are matched case-insensitively to handle servers
+    that emit lowercase variants (e.g. 'httponly', 'secure', 'samesite=lax').
+    """
+    flags = {}
+    flags["HttpOnly"] = bool(re.search(r"(?i)\bhttponly\b", set_cookie_value))
+    flags["Secure"] = bool(re.search(r"(?i)\bsecure\b", set_cookie_value))
+    samesite = re.search(r"(?i)\bsamesite=(\w+)", set_cookie_value)
+    flags["SameSite"] = samesite.group(1).capitalize() if samesite else None
+    maxage = re.search(r"(?i)\bmax-age=(\d+)", set_cookie_value)
+    flags["Max-Age"] = int(maxage.group(1)) if maxage else None
+    domain = re.search(r"(?i)\bdomain=([^;\s]+)", set_cookie_value)
+    flags["Domain"] = domain.group(1) if domain else None
+    path_m = re.search(r"(?i)\bpath=([^;\s]+)", set_cookie_value)
+    flags["Path"] = path_m.group(1) if path_m else None
+    return flags
 
 
-def extract_cookie_header(request_text):
-    """Extract the Cookie header value from a request."""
+def classify_cookie(name, value, flags):
+    """Classify a cookie into one of five purpose kinds.
+
+    Evaluation order (first match wins):
+      csrf    — name matches csrf/xsrf/forgery/antiforgery
+      jwt     — value is a well-formed JWT (eyJ…. eyJ… pattern)
+      device  — Max-Age > 30 days (persistent device/tracking cookie)
+      session — HttpOnly=True (protected from JS, typical session cookie)
+      csrf    — not HttpOnly + high-entropy value (double-submit cookie pattern)
+      other   — everything else
+    """
+    name_lower = name.lower()
+
+    if re.search(r"(csrf|xsrf|forgery|antiforgery)", name_lower):
+        return "csrf"
+
+    if re.match(r"^eyJ[A-Za-z0-9_\-]+\.eyJ", value):
+        return "jwt"
+
+    max_age = flags.get("Max-Age")
+    if max_age and max_age > 86400 * 30:
+        return "device"
+
+    if flags.get("HttpOnly"):
+        return "session"
+
+    if not flags.get("HttpOnly") and len(value) > 20:
+        return "csrf"
+
+    return "other"
+
+
+def parse_all_set_cookies(response_text):
+    """Parse every Set-Cookie header in a response into structured dicts.
+
+    Returns a list of dicts: {name, value, raw, flags, kind}.
+    Malformed Set-Cookie entries (no name=value pair) are skipped.
+    """
+    raw_list = re.findall(r"Set-Cookie:\s*(.+?)\\r\\n", response_text)
+    result = []
+    for raw in raw_list:
+        first = raw.split(";")[0].strip()
+        if "=" not in first:
+            continue
+        name, value = first.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        flags = extract_cookie_flags(raw)
+        kind = classify_cookie(name, value, flags)
+        result.append({"name": name, "value": value, "raw": raw, "flags": flags, "kind": kind})
+    return result
+
+
+def parse_cookie_header(request_text):
+    """Parse all cookies from the Cookie request header.
+
+    Returns a dict mapping cookie name -> value for every cookie present.
+    """
     match = re.search(r"Cookie:\s*(.+?)\\r\\n", request_text)
-    return match.group(1) if match else ""
-
-
-def extract_session_ids(cookie_string):
-    """Extract known session ID values from a cookie string."""
-    ids = {}
-    for pattern, name in [
-        (r"PHPSESSID=([a-f0-9]+)", "PHPSESSID"),
-        (r"JSESSIONID=([A-Fa-f0-9]+)", "JSESSIONID"),
-        (r"ASP\.NET_SessionId=([^\s;]+)", "ASP.NET_SessionId"),
-        (r"connect\.sid=([^\s;]+)", "connect.sid"),
-        (r"\bsession=([^\s;,]+)", "session"),
-    ]:
-        match = re.search(pattern, cookie_string)
-        if match:
-            ids[name] = match.group(1)
-    return ids
+    if not match:
+        return {}
+    cookies = {}
+    for part in match.group(1).split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            cookies[name.strip()] = value.strip()
+    return cookies
 
 
 def extract_hidden_fields(response_text):
@@ -280,10 +369,6 @@ def extract_response_body_tokens(response_text):
             break
     if not body.strip():
         return tokens
-    # When the body was captured via regex from an MCP-format JSON file the
-    # quotes inside the JSON body are still escaped as \" — unescape them so
-    # json.loads can parse the object correctly.  This is a no-op for bodies
-    # that already contain literal quote characters (e.g. XML-export format).
     body = body.replace('\\"', '"').replace('\\\\', '\\')
     try:
         data = json.loads(body)
@@ -323,36 +408,13 @@ def extract_auth_request_headers(request_text):
     return found
 
 
-def extract_cookie_flags(set_cookie_value):
-    """Extract security flags from a Set-Cookie header value."""
-    flags = {}
-    flags["HttpOnly"] = "HttpOnly" in set_cookie_value
-    flags["Secure"] = "Secure" in set_cookie_value
-    samesite = re.search(r"SameSite=(\w+)", set_cookie_value)
-    flags["SameSite"] = samesite.group(1) if samesite else None
-    maxage = re.search(r"Max-Age=(\d+)", set_cookie_value)
-    flags["Max-Age"] = int(maxage.group(1)) if maxage else None
-    domain = re.search(r"[Dd]omain=([^;\s]+)", set_cookie_value)
-    flags["Domain"] = domain.group(1) if domain else None
-    path = re.search(r"[Pp]ath=([^;\s]+)", set_cookie_value)
-    flags["Path"] = path.group(1) if path else None
-    return flags
-
-
 def item_has_auth_identifiers(item):
-    """Return True if the item carries any session cookie, auth token, or CSRF field.
-
-    Used to decide whether a diagram step is worth showing on hosts that have
-    at least some auth traffic, and to decide whether to render the three
-    identifier sections at all for a given host.
-    """
+    """Return True if the item carries any cookie, auth token, or CSRF field."""
     return bool(
-        item['session_ids_sent']
-        or item['session_ids_set']
-        or item['set_cookies_raw']
-        or item.get('auth_request_headers')
-        or item.get('response_tokens')
-        or item['hidden_fields']
+        item.get("cookies_set")
+        or item.get("auth_request_headers")
+        or item.get("response_tokens")
+        or item["hidden_fields"]
     )
 
 
@@ -396,11 +458,11 @@ def process_files(files):
         host_match = re.search(r"Host:\s*(.+?)\\r\\n", req)
         host = host_match.group(1).strip() if host_match else "unknown"
 
-        # Timestamp: Burp XML export time (notes) > HTTP Date header > now
         dt = _parse_xml_time(notes) or parse_date_header(resp) or now
 
-        set_cookies = extract_set_cookies(resp)
-        cookies_sent = extract_cookie_header(req)
+        cookies_set = parse_all_set_cookies(resp)
+        cookies_sent = parse_cookie_header(req)
+
         location_match = re.search(r"Location:\s*(.+?)\\r\\n", resp)
         location = location_match.group(1).strip() if location_match else ""
         hidden_fields = extract_hidden_fields(resp)
@@ -412,16 +474,7 @@ def process_files(files):
             body = req.split("\\r\\n\\r\\n", 1)[1]
 
         cred_params = extract_cred_params(body)
-        category = classify_item(method, path, status, location, set_cookies, body)
-
-        session_ids_sent = extract_session_ids(cookies_sent)
-        session_ids_set = {}
-        cookie_flags = {}
-        for sc in set_cookies:
-            sids = extract_session_ids(sc)
-            session_ids_set.update(sids)
-            for sid_name in sids:
-                cookie_flags[sid_name] = extract_cookie_flags(sc)
+        category = classify_item(method, path, status, location, body)
 
         masked_creds = []
         for name, val in cred_params:
@@ -441,10 +494,9 @@ def process_files(files):
                 "status": status,
                 "category": category,
                 "location": location,
-                "set_cookies_raw": set_cookies,
-                "session_ids_set": session_ids_set,
-                "session_ids_sent": session_ids_sent,
-                "cookie_flags": cookie_flags,
+                "set_cookies_raw": [c["raw"] for c in cookies_set],
+                "cookies_set": cookies_set,
+                "cookies_sent": cookies_sent,
                 "hidden_fields": [
                     {"name": n, "value": v} for n, v in hidden_fields
                 ],
@@ -465,40 +517,31 @@ def generate_report(items, scope_desc, source_desc):
     """Generate a pre-formatted markdown report with ASCII sequence diagram."""
 
     STATIC_RE = re.compile(r'\.(gif|jpe?g|png|ico|css|woff2?|ttf|svg|js)(\?.*)?$', re.I)
-    WSA = 'web-security-academy.net'
+    WSA = "web-security-academy.net"
 
     def is_visible(item):
-        path = item['path'].split('?')[0]
+        path = item["path"].split("?")[0]
         if STATIC_RE.search(path):
             return False
-        if WSA in item['host'] and item['path'].startswith('/academyLabHeader'):
+        if WSA in item["host"] and item["path"].startswith("/academyLabHeader"):
             return False
         return True
 
-    def pick_session(id_dict, raw_cookies):
-        """Return the first session ID value from a parsed dict or raw Set-Cookie list."""
-        if id_dict.get('session'):
-            return id_dict['session']
-        for val in id_dict.values():
-            return val
-        for sc in (raw_cookies or []):
-            m = re.search(r'\bsession=([^\s;,]+)', sc, re.I)
-            if m:
-                return m.group(1)
-        return None
+    def _display(value):
+        return f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
 
     # Group by host, sort chronologically
     hosts = {}
     for item in items:
-        hosts.setdefault(item['host'], []).append(item)
+        hosts.setdefault(item["host"], []).append(item)
     for h in hosts:
-        hosts[h].sort(key=lambda x: x['timestamp'])
+        hosts[h].sort(key=lambda x: x["timestamp"])
 
     # Auth type classification
-    has_csrf_tokens = any(hf for item in items for hf in item['hidden_fields'])
-    has_mfa = any(item['category'] == 'MFA Challenge' for item in items)
-    has_oauth = any(item['category'] == 'OAuth/SSO Callback' for item in items)
-    has_response_tokens = any(item.get('response_tokens') for item in items)
+    has_csrf_tokens = any(hf for item in items for hf in item["hidden_fields"])
+    has_mfa = any(item["category"] == "MFA Challenge" for item in items)
+    has_oauth = any(item["category"] == "OAuth/SSO Callback" for item in items)
+    has_response_tokens = any(item.get("response_tokens") for item in items)
     if has_oauth:
         auth_type = "OAuth/SSO-based authentication"
     elif has_mfa:
@@ -525,204 +568,221 @@ def generate_report(items, scope_desc, source_desc):
         if not visible:
             continue
 
-        # Skip hosts that have no auth identifiers at all — nothing meaningful
-        # to show for them (no tokens, cookies, or CSRF fields anywhere).
         host_has_auth = any(item_has_auth_identifiers(i) for i in host_items)
         if not host_has_auth:
             continue
 
-        # Filter the diagram to only steps that carry at least one identifier.
-        diagram_items = [i for i in visible if item_has_auth_identifiers(i)]
-
         out.append(f"\n## {host}")
 
-        # Build session lifecycle — two passes so counts are correct regardless
-        # of whether items arrived chronologically or newest-first.
-        sess_order = []    # session IDs in first-seen order
-        sess_info = {}     # sid -> {state, set_on, flags, count}
-
-        # Pass 1: register every session that was set in a response
-        for item in host_items:
-            sid = pick_session(item['session_ids_set'], item['set_cookies_raw'])
-            if sid and sid not in sess_info:
-                if item['category'] in ('Credential Submission', 'Token Exchange'):
-                    state = 'Authenticated'
-                elif item['category'] == 'Logout':
-                    state = 'Post-logout'
-                elif item['category'] == 'MFA Challenge':
-                    state = 'Pre-2FA'
-                else:
-                    state = 'Pre-auth'
-                flags_raw = next(
-                    (sc for sc in item['set_cookies_raw']
-                     if re.search(r'\bsession=', sc, re.I)
-                     or any(k in sc for k in ('PHPSESSID', 'JSESSIONID'))),
-                    ""
-                )
-                sess_info[sid] = {
-                    'state': state,
-                    'set_on': item['path'],
-                    'flags': flags_raw,
-                    'count': 0,
-                }
-                sess_order.append(sid)
-
-        # Pass 2: count how many requests each session was sent with
-        for item in host_items:
-            sent = pick_session(item['session_ids_sent'], [])
-            if sent and sent in sess_info:
-                sess_info[sent]['count'] += 1
-
-        # Token lifecycle — pass 1: register every token issued in a response body
-        token_order = []   # field names in first-seen order
-        token_info = {}    # field -> {value, display, set_on, count, used_via}
+        # ---- Cookie lifecycle — pass 1 ----
+        # Register every non-'other' cookie set during this host's flow.
+        cookie_order = []
+        cookie_info = {}
 
         for item in host_items:
-            for field, value in item.get('response_tokens', {}).items():
+            for c in item.get("cookies_set", []):
+                if c["kind"] == "other":
+                    continue
+                name = c["name"]
+                if name not in cookie_info:
+                    if item["category"] in ("Credential Submission", "Token Exchange"):
+                        state = "Authenticated"
+                    elif item["category"] == "Logout":
+                        state = "Post-logout"
+                    elif item["category"] == "MFA Challenge":
+                        state = "Pre-2FA"
+                    else:
+                        state = "Pre-auth"
+                    cookie_info[name] = {
+                        "kind": c["kind"],
+                        "value": c["value"],
+                        "display": _display(c["value"]),
+                        "set_on": item["path"],
+                        "state": state,
+                        "flags": c["flags"],
+                        "count": 0,
+                    }
+                    cookie_order.append(name)
+
+        # ---- Cookie lifecycle — pass 2 ----
+        # Count requests that sent each registered cookie.
+        for item in host_items:
+            for name in item.get("cookies_sent", {}):
+                if name in cookie_info:
+                    cookie_info[name]["count"] += 1
+
+        # Items that send a registered session/jwt cookie also appear in diagram
+        registered_session_names = {
+            n for n, info in cookie_info.items() if info["kind"] in ("session", "jwt")
+        }
+        diagram_items = [
+            i for i in visible
+            if item_has_auth_identifiers(i)
+            or any(name in registered_session_names for name in i.get("cookies_sent", {}))
+        ]
+
+        # ---- Token lifecycle — pass 1 ----
+        token_order = []
+        token_info = {}
+
+        for item in host_items:
+            for field, value in item.get("response_tokens", {}).items():
                 if field not in token_info:
-                    display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
                     token_info[field] = {
-                        'value': value,
-                        'display': display,
-                        'set_on': item['path'],
-                        'count': 0,
-                        'used_via': set(),
+                        "value": value,
+                        "display": _display(value),
+                        "set_on": item["path"],
+                        "count": 0,
+                        "used_via": set(),
                     }
                     token_order.append(field)
 
-        # Token lifecycle — pass 2: count requests that carry each token.
-        # If a token appears in a request header but was not found in any captured
-        # response body, register it as an orphaned entry so it still appears in
-        # the Token Identifiers table (origin marked as "not captured in history").
+        # ---- Token lifecycle — pass 2 ----
         for item in host_items:
-            for header, value in item.get('auth_request_headers', {}).items():
+            for header, value in item.get("auth_request_headers", {}).items():
                 matched = False
                 for field in token_order:
-                    if token_info[field]['value'] == value:
-                        token_info[field]['count'] += 1
-                        token_info[field]['used_via'].add(header)
+                    if token_info[field]["value"] == value:
+                        token_info[field]["count"] += 1
+                        token_info[field]["used_via"].add(header)
                         matched = True
                 if not matched:
-                    # Orphaned token — seen in request headers, origin not captured
                     orphan_key = f"_orphan_{value[:16]}"
                     if orphan_key not in token_info:
-                        display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
                         token_info[orphan_key] = {
-                            'value': value,
-                            'display': display,
-                            'set_on': '(not captured in history)',
-                            'count': 0,
-                            'used_via': set(),
+                            "value": value,
+                            "display": _display(value),
+                            "set_on": "(not captured in history)",
+                            "count": 0,
+                            "used_via": set(),
                         }
                         token_order.append(orphan_key)
-                    token_info[orphan_key]['count'] += 1
-                    token_info[orphan_key]['used_via'].add(header)
+                    token_info[orphan_key]["count"] += 1
+                    token_info[orphan_key]["used_via"].add(header)
 
-        # ---- ASCII Sequence Diagram ----
-        L = 52  # left column width
+        # ---- Session Identifier Origins ----
         out += [
             "",
-            "### Sequence Diagram",
+            "### Session Identifier First Seen",
             "",
-            "```",
-            f"{'Browser':<{L}}Server",
-            f"  |{' ' * (L - 3)}|",
+            "| # | Identifier | Kind | Value | First Appeared In | Direction | State |",
+            "|---|---|---|---|---|---|---|",
         ]
 
-        for step, item in enumerate(diagram_items, 1):
-            # Request annotations
-            req_lines = [f"{step}. {item['method']} {item['path']}"]
+        origins = []
+        csrf_seen = set()
 
-            sent = pick_session(item['session_ids_sent'], [])
-            if sent:
-                req_lines.append(f"  Cookie: session={sent[:8]}...{sent[-4:]}")
+        # Cookies (session, jwt, device) — in order first seen
+        for name in cookie_order:
+            info = cookie_info[name]
+            if info["kind"] == "other":
+                continue
+            origins.append({
+                "identifier": name,
+                "kind": info["kind"],
+                "display": info["display"],
+                "first_seen": info["set_on"],
+                "direction": "Response (`Set-Cookie`)",
+                "state": info["state"],
+            })
 
-            for header, value in item.get('auth_request_headers', {}).items():
-                display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
-                req_lines.append(f"  {header}: {display}")
+        # Response body tokens
+        for field in token_order:
+            if field.startswith("_orphan_"):
+                continue
+            info = token_info[field]
+            origins.append({
+                "identifier": field,
+                "kind": "token",
+                "display": info["display"],
+                "first_seen": info["set_on"],
+                "direction": "Response (body JSON)",
+                "state": "—",
+            })
 
-            for cp in item['cred_params']:
-                req_lines.append(f"  {cp['name']}={cp['value']}")
+        # CSRF hidden fields — first occurrence per field name
+        for item in host_items:
+            for hf in item["hidden_fields"]:
+                if hf["name"] not in csrf_seen:
+                    csrf_seen.add(hf["name"])
+                    origins.append({
+                        "identifier": hf["name"],
+                        "kind": "csrf",
+                        "display": _display(hf["value"]),
+                        "first_seen": item["path"],
+                        "direction": "Response (hidden field)",
+                        "state": "Pre-auth",
+                    })
 
-            for line in req_lines:
-                out.append(f"  |  {line:<{L - 5}}|")
-            out.append(f"  |{'-' * (L - 4)}>|")
+        if origins:
+            for i, o in enumerate(origins, 1):
+                out.append(
+                    f"| {i} | `{o['identifier']}` | {o['kind']} | `{o['display']}` "
+                    f"| `{o['first_seen']}` | {o['direction']} | {o['state']} |"
+                )
+        else:
+            out.append("No session identifiers detected.")
 
-            # Response annotations
-            resp_lines = []
-            if item['location']:
-                resp_lines.append(f"{item['status']} Found -> {item['location']}")
-            else:
-                resp_lines.append(f"{item['status']} OK")
-
-            set_sid = pick_session(item['session_ids_set'], item['set_cookies_raw'])
-            if set_sid:
-                resp_lines.append(f"Set-Cookie: session={set_sid[:8]}...{set_sid[-4:]}")
-                if item['category'] in ('Credential Submission', 'Token Exchange') and sent:
-                    resp_lines.append("(session rotated on login)")
-
-            for field, value in item.get('response_tokens', {}).items():
-                display = f"{value[:8]}...{value[-4:]}" if len(value) > 12 else value
-                resp_lines.append(f"token ({field}): {display}")
-
-            for hf in item['hidden_fields']:
-                resp_lines.append(f"Hidden: {hf['name']}={hf['value'][:16]}...")
-
-            for line in resp_lines:
-                out.append(f"  |  {line:<{L - 5}}|")
-            out.append(f"  |<{'-' * (L - 4)}|")
-            out.append(f"  |{' ' * (L - 3)}|")
-
-        out.append("```")
-
-        # ---- Session Identifiers / Token Identifiers / CSRF ----
-        # Only rendered when the host has at least one auth identifier; if every
-        # request and response for this host is unauthenticated these three
-        # sections are suppressed entirely to keep the report clean.
+        # ---- Session & Cookie Identifiers ----
         if host_has_auth:
-            # Session Identifiers
-            out += ["", "### Session Identifiers", ""]
-            if sess_order:
-                out.append("| # | session | State | Set On | Requests |")
-                out.append("|---|---|---|---|---|")
-                for i, sid in enumerate(sess_order, 1):
-                    info = sess_info[sid]
-                    out.append(
-                        f"| {i} | `{sid}` | {info['state']} "
-                        f"| `{info['set_on']}` | {info['count']} |"
-                    )
+            out += ["", "### Session & Cookie Identifiers", ""]
 
-                first_flags = sess_info[sess_order[0]]['flags']
-                flag_parts = []
-                if 'Secure' in first_flags:
-                    flag_parts.append('`Secure` ✓')
-                if 'HttpOnly' in first_flags:
-                    flag_parts.append('`HttpOnly` ✓')
-                m = re.search(r'SameSite=(\w+)', first_flags)
-                if m:
-                    val = m.group(1)
-                    emoji = '⚠️' if val == 'None' else ('✓' if val == 'Strict' else '~')
-                    flag_parts.append(f'`SameSite={val}` {emoji}')
-                if flag_parts:
-                    out.append(f"\n**Cookie flags:** {' · '.join(flag_parts)}")
+            session_jwt = [
+                (n, cookie_info[n]) for n in cookie_order
+                if cookie_info[n]["kind"] in ("session", "jwt")
+            ]
+            device = [
+                (n, cookie_info[n]) for n in cookie_order
+                if cookie_info[n]["kind"] == "device"
+            ]
+
+            rows = session_jwt + device
+            if rows:
+                out.append("| # | Name | Kind | Flags | Set On | State | Requests |")
+                out.append("|---|---|---|---|---|---|---|")
+                for row_num, (name, info) in enumerate(rows, 1):
+                    f = info["flags"]
+                    flag_parts = []
+                    if f.get("Secure"):
+                        flag_parts.append("`Secure`")
+                    if f.get("HttpOnly"):
+                        flag_parts.append("`HttpOnly`")
+                    ss = f.get("SameSite")
+                    if ss:
+                        emoji = " ⚠️" if ss == "None" else ""
+                        flag_parts.append(f"`SameSite={ss}`{emoji}")
+                    ma = f.get("Max-Age")
+                    if ma:
+                        flag_parts.append(f"`Max-Age={ma}`")
+                    flags_str = " ".join(flag_parts) if flag_parts else "—"
+                    out.append(
+                        f"| {row_num} | `{name}` | {info['kind']} | {flags_str} "
+                        f"| `{info['set_on']}` | {info['state']} | {info['count']} |"
+                    )
             else:
                 out.append("No session cookies observed.")
 
-            # Token Identifiers
+            # ---- Token Identifiers ----
             out += ["", "### Token Identifiers", ""]
             if token_order:
                 out.append("| # | Field | Value | Issued On | Requests | Via Header |")
                 out.append("|---|---|---|---|---|---|")
                 for i, field in enumerate(token_order, 1):
                     info = token_info[field]
-                    # For orphaned tokens, derive the field label from the headers
-                    # that carried it (known only after pass 2 completes).
                     if field.startswith("_orphan_"):
-                        display_field = " / ".join(sorted(info['used_via'])) if info['used_via'] else "token"
+                        display_field = (
+                            " / ".join(sorted(info["used_via"])) if info["used_via"] else "token"
+                        )
                     else:
                         display_field = field
-                    via = ", ".join(f"`{h}`" for h in sorted(info['used_via'])) if info['used_via'] else "—"
-                    issued = info['set_on'] if info['set_on'].startswith('(') else f"`{info['set_on']}`"
+                    via = (
+                        ", ".join(f"`{h}`" for h in sorted(info["used_via"]))
+                        if info["used_via"] else "—"
+                    )
+                    issued = (
+                        info["set_on"] if info["set_on"].startswith("(")
+                        else f"`{info['set_on']}`"
+                    )
                     out.append(
                         f"| {i} | `{display_field}` | `{info['display']}` "
                         f"| {issued} | {info['count']} | {via} |"
@@ -730,62 +790,83 @@ def generate_report(items, scope_desc, source_desc):
             else:
                 out.append("No response body tokens detected.")
 
-            # CSRF / Anti-Forgery Tokens
+            # ---- CSRF / Anti-Forgery Tokens ----
             out += ["", "### CSRF / Anti-Forgery Tokens", ""]
-            csrf_pairs = [(item, hf) for item in host_items for hf in item['hidden_fields']]
-            if csrf_pairs:
-                out.append("| Token Name | Value | Found In | Submitted In |")
+            csrf_rows = []
+
+            # Hidden form fields
+            for item in host_items:
+                for hf in item["hidden_fields"]:
+                    csrf_rows.append(("hidden field", hf["name"], hf["value"], item["path"]))
+
+            # Set-Cookie CSRF tokens
+            for name in cookie_order:
+                if cookie_info[name]["kind"] == "csrf":
+                    info = cookie_info[name]
+                    csrf_rows.append(("Set-Cookie", name, info["value"], info["set_on"]))
+
+            if csrf_rows:
+                out.append("| Token Name | Mechanism | Value | Found In |")
                 out.append("|---|---|---|---|")
-                for item, hf in csrf_pairs:
+                for mechanism, name, value, path in csrf_rows:
+                    display = f"{value[:20]}..." if len(value) > 20 else value
                     out.append(
-                        f"| `{hf['name']}` | `{hf['value'][:20]}` "
-                        f"| `{item['path']}` (hidden) | — |"
+                        f"| `{name}` | {mechanism} | `{display}` | `{path}` |"
                     )
             else:
                 out.append("No CSRF tokens detected.")
 
         # ---- Per-host findings ----
-        CSRF_TOKEN_NAMES = ('csrf_token', 'user_token', '_token', 'authenticity_token')
+        CSRF_TOKEN_NAMES = ("csrf_token", "user_token", "_token", "authenticity_token")
         for item in host_items:
             if (
-                item['method'] == 'POST'
-                and item['category'] not in (
-                    'Credential Submission', 'Token Exchange', 'MFA Challenge'
+                item["method"] == "POST"
+                and item["category"] not in (
+                    "Credential Submission", "Token Exchange", "MFA Challenge"
                 )
                 and not any(
-                    hf['name'].lower() in CSRF_TOKEN_NAMES
-                    for hf in item['hidden_fields']
+                    hf["name"].lower() in CSRF_TOKEN_NAMES
+                    for hf in item["hidden_fields"]
                 )
             ):
                 global_findings.append(
-                    ('High', 'No CSRF protection',
+                    ("High", "No CSRF protection",
                      f"`{item['method']} {item['path']}`")
                 )
 
-        if any('SameSite=None' in sc for item in host_items for sc in item['set_cookies_raw']):
+        if any(
+            c["flags"].get("SameSite") == "None"
+            for item in host_items
+            for c in item.get("cookies_set", [])
+        ):
             global_findings.append((
-                'Medium', '`SameSite=None` on session cookie',
-                'Cross-site requests carry the session — no browser CSRF barrier',
+                "Medium", "`SameSite=None` on session cookie",
+                "Cross-site requests carry the session — no browser CSRF barrier",
             ))
 
         for item in host_items:
-            if item['category'] == 'Credential Submission' and item['set_cookies_raw']:
+            if item["category"] == "Credential Submission" and any(
+                c["kind"] in ("session", "jwt")
+                for c in item.get("cookies_set", [])
+            ):
                 global_findings.append((
-                    '✓ Good', 'Session rotation on login',
+                    "✓ Good", "Session rotation on login",
                     f"New session issued on `POST {item['path']}`",
                 ))
                 break
 
         sess_cookies = [
-            sc for item in host_items for sc in item['set_cookies_raw']
-            if re.search(r'\bsession=', sc, re.I)
+            c for item in host_items
+            for c in item.get("cookies_set", [])
+            if c["kind"] == "session"
         ]
         if sess_cookies and all(
-            'Secure' in sc and 'HttpOnly' in sc for sc in sess_cookies
+            c["flags"].get("Secure") and c["flags"].get("HttpOnly")
+            for c in sess_cookies
         ):
             global_findings.append((
-                '✓ Good', '`Secure` + `HttpOnly` flags',
-                'All session cookies — prevents sniffing and JS theft',
+                "✓ Good", "`Secure` + `HttpOnly` flags",
+                "All session cookies — prevents sniffing and JS theft",
             ))
 
     # Deduplicate findings (keep first occurrence)
@@ -840,7 +921,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Parse Burp HTTP History for authentication flows"
     )
-    parser.add_argument("files", nargs="+", help="Burp history files (XML, JSON, or raw text)")
+    parser.add_argument(
+        "files", nargs="*",
+        help="Burp history files (XML, JSON, or raw text)"
+    )
     parser.add_argument(
         "--last", "-n", type=int, default=0,
         help="Keep only the last N items in fetch order (0 = all, default: 0)",
@@ -849,7 +933,19 @@ def main():
         "--report", action="store_true",
         help="Output a pre-formatted markdown report instead of JSON",
     )
+    parser.add_argument(
+        "--version", action="store_true",
+        help="Print version and changelog, then exit",
+    )
     args = parser.parse_args()
+
+    if args.version:
+        print(f"parse_burp_history.py v{VERSION}")
+        print(CHANGELOG)
+        return
+
+    if not args.files:
+        parser.error("at least one file is required")
 
     items = process_files(args.files)
 

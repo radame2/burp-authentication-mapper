@@ -87,33 +87,6 @@ Report the total size freed to the user.
 
 Output the script's stdout verbatim. Do not reformat or regenerate any section — the script has already produced the complete report. Prepend a one-line target/date context header if it adds useful orientation for the user.
 
-### Step 4: Security Assessment
-
-After displaying the report, read `references/security_checklist.md` and evaluate the captured authentication flow against every check in the file. Use only evidence present in the report output — do not infer or assume behaviour that wasn't observed.
-
-Output a `## Security Assessment` section with one table per checklist category. Each table has three columns: **Check**, **Result**, **Notes**.
-
-**Result values:**
-- `✅ Pass` — evidence in the report confirms the good condition
-- `❌ Fail` — evidence in the report confirms the bad condition
-- `⚠️ Cannot determine` — insufficient data in the captured history to evaluate
-
-**Notes** should cite the specific request, response header, cookie flag, or token observed. Keep notes concise (one line).
-
-Evaluate all eight categories from the checklist:
-1. Transport Security
-2. Session Management
-3. CSRF Protection
-4. Credential Handling
-5. Error Handling
-6. Multi-Factor Authentication
-7. Brute Force Protection
-8. Logout Security
-
-After the tables, add a brief `### Summary` with:
-- Total Pass / Fail / Cannot determine counts
-- The two or three highest-priority issues to address (Fail items, ranked by risk)
-
 ## Edge Case Handling
 
 - **No items found:** Inform the user and suggest selecting "All in history" scope or verifying the local file contains Burp history data
